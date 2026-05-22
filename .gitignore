@@ -1,0 +1,16 @@
+# editors
+.vscode/
+.idea/
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+
+# local-only overrides
+*.local.*

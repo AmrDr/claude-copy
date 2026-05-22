@@ -4,34 +4,69 @@
 ; ============================================================
 ;  Claude Copy  -  copy Claude Code's last answer
 ;  ------------------------------------------------------------
-;  Hotkey:  Ctrl + Alt + C
+;  Hotkey is read from:
+;    %LOCALAPPDATA%\ClaudeCopy\config.ini   ([hotkey] combo = ...)
 ;
-;  Reads the title of the active terminal window and passes it to
-;  copy-last-answer.ps1, which finds the matching Claude session
-;  and copies its last answer to the clipboard.
-;
-;  Change the hotkey: edit the  ^!c::  line below.
-;     ^ = Ctrl    ! = Alt    + = Shift    # = Windows key
-;  Examples:  ^+y::  (Ctrl+Shift+Y)     #c::  (Win+C)
+;  Default: ctrl+alt+c. Edit the file and restart this script
+;  (or re-run install.ps1) to change it.
 ; ============================================================
 
 scriptPath := A_ScriptDir . "\copy-last-answer.ps1"
+configFile := EnvGet("LOCALAPPDATA") . "\ClaudeCopy\config.ini"
 statusFile := A_Temp . "\claude-copy-status.txt"
 titleFile  := A_Temp . "\claude-copy-title.txt"
 
-gLastTermTitle := ""   ; title of the most recently focused terminal
+gLastTermTitle := ""    ; title of the most recently focused terminal
 
-A_IconTip := "Claude Copy  -  Ctrl+Alt+C copies the active terminal's last answer"
-TrayTip("Ctrl + Alt + C  copies Claude's last answer", "Claude Copy active", 1)
+; ---- Read hotkey from config ----
+hotkeyCombo := "ctrl+alt+c"
+try {
+    v := IniRead(configFile, "hotkey", "combo", "")
+    if (v != "")
+        hotkeyCombo := v
+} catch {
+}
+ahkHotkey := ToAhkHotkey(hotkeyCombo)
 
-; Remember the active terminal window, so the hotkey still targets
-; the right session even if you already switched to another app.
+A_IconTip := "Claude Copy  -  " . hotkeyCombo
+TrayTip("Hotkey: " . hotkeyCombo, "Claude Copy active", 1)
+
+; ---- Bind hotkey dynamically (with a clear error if it's invalid) ----
+try {
+    Hotkey(ahkHotkey, (*) => CopyClaudeAnswer())
+} catch as e {
+    MsgBox(
+        "Claude Copy could not register hotkey '" . hotkeyCombo . "'"
+        . " (AHK form: '" . ahkHotkey . "').`n`n"
+        . "Error: " . e.Message . "`n`n"
+        . "Edit " . configFile . " and reload this script.",
+        "Claude Copy", "Iconx")
+    ExitApp(1)
+}
+
+; Track the most recently focused terminal window.
 SetTimer(TrackTerminal, 300)
 
-; ---- The hotkey ----
-^!c:: CopyClaudeAnswer()
+; ---- Translate "ctrl+alt+c" -> AHK syntax "^!c" ----
+ToAhkHotkey(s) {
+    s := StrLower(s)
+    mods := Map(
+        "ctrl",    "^", "control", "^",
+        "alt",     "!", "option",  "!",
+        "shift",   "+",
+        "win",     "#", "super",   "#", "cmd", "#", "command", "#", "meta", "#")
+    out := ""
+    base := ""
+    for i, raw in StrSplit(s, "+") {
+        k := Trim(raw, " `t")
+        if mods.Has(k)
+            out .= mods[k]
+        else if (k != "")
+            base := k
+    }
+    return out . base
+}
 
-; Window classes / processes treated as terminals. Add yours if needed.
 IsTerminalProc(proc) {
     static known := Map(
         "WindowsTerminal.exe", 1, "WindowsTerminalPreview.exe", 1,
@@ -51,14 +86,13 @@ TrackTerminal() {
                 gLastTermTitle := tt
         }
     } catch {
-        ; active window not queryable right now - ignore
     }
 }
 
 CopyClaudeAnswer() {
     global scriptPath, statusFile, titleFile, gLastTermTitle
 
-    ; Title of the active (else the last active) terminal window.
+    ; Active (or last active) terminal window title.
     title := ""
     try {
         if IsTerminalProc(WinGetProcessName("A"))
@@ -68,7 +102,7 @@ CopyClaudeAnswer() {
     if (title = "")
         title := gLastTermTitle
 
-    ; Write the title to a file (UTF-8, no BOM).
+    ; Hand the title to PowerShell via a temp file (UTF-8, no BOM).
     try {
         f := FileOpen(titleFile, "w", "UTF-8-RAW")
         if f {
@@ -77,8 +111,6 @@ CopyClaudeAnswer() {
         }
     } catch {
     }
-
-    ; Remove the stale status file.
     try {
         if FileExist(statusFile)
             FileDelete(statusFile)
@@ -87,7 +119,6 @@ CopyClaudeAnswer() {
 
     args := '-NoProfile -ExecutionPolicy Bypass -File "' . scriptPath . '" "' . statusFile . '" "' . titleFile . '"'
 
-    ; Prefer pwsh (PowerShell 7), fall back to Windows PowerShell.
     launched := false
     for i, exe in ["pwsh.exe", "powershell.exe"] {
         try {
@@ -121,7 +152,6 @@ CopyClaudeAnswer() {
     }
 }
 
-; Short, self-dismissing tooltip near the mouse cursor.
 Toast(text) {
     ToolTip(text)
     SetTimer(() => ToolTip(), -2500)

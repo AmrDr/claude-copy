@@ -4,35 +4,59 @@
   Extracts the most recent response of a Claude Code session and
   copies it to the Windows clipboard.
 
-  Normally invoked by claude-copy.ahk, which passes:
+  Invoked by claude-copy.ahk with two positional arguments:
     1. $StatusFile - this script writes "OK ..." / "ERR ..." there
-    2. $TitleFile  - a file containing the active terminal window title
+    2. $TitleFile  - a file holding the active terminal window title
 
   Picking the right session:
     Claude Code writes {"type":"ai-title", ...} entries into its
-    transcript, and the terminal window title mirrors that ai-title.
-    This script matches the active window title against every
-    session's ai-title and reads that session's transcript. If no
-    match is found, the most recently updated transcript is used.
+    transcript; the terminal window title mirrors that ai-title.
+    This script finds the session whose ai-title appears in the
+    window title and extracts its last response turn. If no match
+    is found, it falls back to the most recently updated transcript.
+
+  Configuration (mode, output truncation) comes from:
+    %LOCALAPPDATA%\ClaudeCopy\config.ini
 
   See README.md for details and limitations.
 #>
 param([string]$StatusFile, [string]$TitleFile)
 
-# ============================ CONFIGURATION ============================
-# What to copy from Claude's most recent response:
-#   'text'        Only Claude's answer text (including ``` code blocks
-#                 that are part of the answer itself).
-#   'text+code'   Answer text + commands Claude ran + files it wrote/edited.
-#   'everything'  All of the above + the output of every tool call.
+# Defaults if config.ini is missing or has no value.
 $CopyMode = 'text'
-
-# In 'everything' mode, truncate each tool output to this many
-# characters (0 = no limit).
 $MaxToolOutputChars = 0
-# =======================================================================
 
+# --- Override defaults from config.ini if present ----------------------
+$ConfigFile = Join-Path $env:LOCALAPPDATA 'ClaudeCopy\config.ini'
+
+function Get-IniValue([string]$path, [string]$section, [string]$key, [string]$default) {
+    if (-not (Test-Path -LiteralPath $path)) { return $default }
+    $inSec = $false
+    foreach ($raw in (Get-Content -LiteralPath $path -Encoding UTF8)) {
+        $t = $raw.Trim()
+        if ($t -eq '' -or $t.StartsWith('#') -or $t.StartsWith(';')) { continue }
+        if ($t -match '^\[(.+?)\]$') {
+            $inSec = ($Matches[1].Trim().ToLower() -eq $section.ToLower())
+            continue
+        }
+        if (-not $inSec) { continue }
+        if ($t -match '^([^=]+)=(.*)$') {
+            if ($Matches[1].Trim().ToLower() -eq $key.ToLower()) {
+                return $Matches[2].Trim()
+            }
+        }
+    }
+    return $default
+}
+
+$cfgMode = (Get-IniValue $ConfigFile 'copy' 'mode' '').ToLower()
+if ($cfgMode -in @('text', 'text+code', 'everything')) { $CopyMode = $cfgMode }
+$cfgMax = Get-IniValue $ConfigFile 'copy' 'max_tool_output_chars' ''
+if ($cfgMax -match '^\d+$') { $MaxToolOutputChars = [int]$cfgMax }
+
+# Final safety
 if ($CopyMode -notin @('text', 'text+code', 'everything')) { $CopyMode = 'text' }
+# ----------------------------------------------------------------------
 
 function Write-Status([string]$msg) {
     Write-Output $msg
@@ -58,8 +82,7 @@ function Get-AiTitle([string]$path) {
     return ''
 }
 
-# Is this entry a real user prompt (= the start of a turn)?
-# Tool results, system reminders and meta entries do NOT count.
+# True if this entry is a real user prompt (= start of a turn).
 function Test-RealPrompt($obj) {
     if ($obj.type -ne 'user' -or $obj.message.role -ne 'user') { return $false }
     if ($obj.isMeta -eq $true) { return $false }
@@ -75,7 +98,6 @@ function Test-RealPrompt($obj) {
     return ($hasText -and -not $isToolResult)
 }
 
-# Render a tool_use block (command run / file written / etc.).
 function Format-ToolUse($b) {
     $name = [string]$b.name
     $inp  = $b.input
@@ -94,7 +116,6 @@ function Format-ToolUse($b) {
     return ">>> Tool ($name): $j"
 }
 
-# Render a tool_result block (the output of a tool call).
 function Format-ToolResult($b) {
     $c = $b.content
     $txt = ''
@@ -116,15 +137,13 @@ function Format-ToolResult($b) {
     return $label + "`n" + $txt
 }
 
-# Extract the whole last response turn from a transcript.
 function Get-LastAnswer([string]$path) {
     $includeTools  = ($CopyMode -eq 'text+code' -or $CopyMode -eq 'everything')
     $includeOutput = ($CopyMode -eq 'everything')
 
     $lines = Get-Content -LiteralPath $path -Encoding UTF8
 
-    # Phase A: find the last 'assistant' line. Anything after it
-    # (shell commands, a new prompt without an answer, ...) is ignored.
+    # Phase A: last 'assistant' line.
     $lastAsst = -1
     for ($i = $lines.Count - 1; $i -ge 0; $i--) {
         if ([string]::IsNullOrWhiteSpace($lines[$i])) { continue }
@@ -133,7 +152,7 @@ function Get-LastAnswer([string]$path) {
     }
     if ($lastAsst -lt 0) { return '' }
 
-    # Phase B: walk back to the start of the turn (line after the prompt).
+    # Phase B: turn start = line after the prompt.
     $turnStart = 0
     for ($i = $lastAsst; $i -ge 0; $i--) {
         if ([string]::IsNullOrWhiteSpace($lines[$i])) { continue }
@@ -141,7 +160,7 @@ function Get-LastAnswer([string]$path) {
         if (Test-RealPrompt $o) { $turnStart = $i + 1; break }
     }
 
-    # Phase C: walk the turn forward, emitting blocks in order.
+    # Phase C: forward through the turn, in order.
     $parts = [System.Collections.Generic.List[string]]::new()
     for ($i = $turnStart; $i -le $lastAsst; $i++) {
         if ([string]::IsNullOrWhiteSpace($lines[$i])) { continue }
@@ -160,7 +179,7 @@ function Get-LastAnswer([string]$path) {
                     elseif ($b.type -eq 'tool_use' -and $includeTools) {
                         $parts.Add((Format-ToolUse $b))
                     }
-                    # 'thinking' blocks are always skipped
+                    # 'thinking' is always skipped
                 }
             }
         }
@@ -184,7 +203,6 @@ try {
     $projectsDir = Join-Path $env:USERPROFILE '.claude\projects'
     if (-not (Test-Path $projectsDir)) { Write-Status 'ERR .claude\projects folder not found'; exit 1 }
 
-    # Newest transcript per project folder.
     $candidates = @()
     foreach ($folder in (Get-ChildItem -LiteralPath $projectsDir -Directory -ErrorAction SilentlyContinue)) {
         $j = Get-ChildItem -LiteralPath $folder.FullName -Filter *.jsonl -File -ErrorAction SilentlyContinue |
@@ -193,13 +211,11 @@ try {
     }
     if ($candidates.Count -eq 0) { Write-Status 'ERR No transcript found'; exit 1 }
 
-    # Active terminal window title.
     $winTitle = ''
     if ($TitleFile -and (Test-Path -LiteralPath $TitleFile)) {
         try { $winTitle = ([string](Get-Content -LiteralPath $TitleFile -Raw -Encoding UTF8)).Trim() } catch { }
     }
 
-    # Match the window title to a session via its ai-title.
     $target = $null
     $how = 'newest transcript'
     if ($winTitle.Length -ge 3) {
